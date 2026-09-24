@@ -38,6 +38,7 @@ class EkfacConfig:
     random projection (``P_S @ (H^-1 G) @ P_A^T``)."""
     projection_type: Literal["normal", "rademacher"] = "rademacher"
     projection_scale: Literal["jl", "row_norm"] = "jl"
+    projection_seed: int | None = None
     """Must match the index being scored. See ``IndexConfig``."""
     preconditioner_path: str = ""
     """Safetensors of a diagonal optimizer preconditioner (module name ->
@@ -209,7 +210,7 @@ class EkfacApplicator:
                         g.device,
                         self.cfg.projection_type,
                         self.cfg.projection_scale,
-                        None,
+                        self.cfg.projection_seed,
                     )
                     P_r = create_module_projection_matrix(
                         name,
@@ -220,7 +221,7 @@ class EkfacApplicator:
                         g.device,
                         self.cfg.projection_type,
                         self.cfg.projection_scale,
-                        None,
+                        self.cfg.projection_seed,
                     )
                     transformed[name] = torch.einsum("ps,nsa,ra->npr", P_l, g, P_r)
                 self.logger.debug("Compressed IVHP output to [p, p] per module")
