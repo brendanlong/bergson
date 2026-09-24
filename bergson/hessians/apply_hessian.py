@@ -15,6 +15,7 @@ from bergson.collector.collector import create_projection_matrix
 from bergson.config import InversionConfig
 from bergson.data import column_offsets, create_index, load_gradients
 from bergson.distributed import init_dist
+from bergson.gradients import GradientProcessor
 from bergson.hessians.hessian_approximations import partition_modules
 from bergson.hessians.preconditioner import (
     DiagonalFactoredPreconditioner,
@@ -210,6 +211,13 @@ class EkfacApplicator:
                 torch.cuda.empty_cache()
 
         grad_buffer.flush()
+        if p > 0 and self.rank == 0:
+            # Records the projection so scoring can check it matches the index.
+            GradientProcessor(
+                projection_dim=p,
+                projection_type=self.cfg.projection_type,
+                projection_scale=self.cfg.projection_scale,
+            ).save(Path(self.cfg.run_path))
 
         self.logger.info(f"Saved IVHP gradients to {self.cfg.run_path}")
 

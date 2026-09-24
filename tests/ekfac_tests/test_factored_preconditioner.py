@@ -19,6 +19,7 @@ from safetensors.torch import load_file, save_file
 from bergson.collector.collector import create_projection_matrix
 from bergson.config import InversionConfig
 from bergson.data import create_index, load_module_gradients
+from bergson.gradients import check_saved_projection_version
 from bergson.hessians.apply_hessian import EkfacApplicator, EkfacConfig
 from bergson.hessians.inversion import INVERSIONS
 from bergson.hessians.preconditioner import FactoredPreconditioner
@@ -281,6 +282,8 @@ def test_apply_hessian_compresses_per_module(tmp_path):
     )
     EkfacApplicator(compressed_cfg, inversion_cfg=inversion_cfg).compute_ivhp_sharded()
     got = load_module_gradients(str(tmp_path / "out_compressed"))
+    # Scoring checks the projection version saved with the compressed query.
+    check_saved_projection_version(tmp_path / "out_compressed")
 
     for name, (o, i) in modules.items():
         full = torch.from_numpy(np.asarray(ref[name][:])).view(num_grads, o, i)

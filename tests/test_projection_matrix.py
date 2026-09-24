@@ -16,6 +16,7 @@ from bergson.collector.gradient_collectors import GradientCollector
 from bergson.collector.projection_matrix import random_matrix
 from bergson.config import IndexConfig, ScoreConfig
 from bergson.gradients import PROJECTION_VERSION
+from bergson.process_grads import mix_autocorrelation_matrices
 from bergson.score.score import get_query_grads
 
 SHAPES = [(2, 4), (7, 1001), (64, 13824), (64, 1 << 20)]
@@ -38,9 +39,7 @@ def test_matrices_are_pinned():
     )
     rademacher = random_matrix("layer/left", 16, 64, "cpu", "rademacher")
     digest = hashlib.sha256(rademacher.numpy().tobytes()).hexdigest()
-    assert (
-        digest == "45963e4eeac702ac79e13489248f0d2c849e7b1bae8efdb8849b3c990911f4ef"
-    )
+    assert digest == "45963e4eeac702ac79e13489248f0d2c849e7b1bae8efdb8849b3c990911f4ef"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -49,6 +48,7 @@ def test_cuda_matches_cpu(shape):
     m, n = shape
     cpu = random_matrix("layer/left", m, n, "cpu", "rademacher")
     cuda = random_matrix("layer/left", m, n, "cuda", "rademacher")
+    assert not projection_matrix._kernels_failed, "the CUDA kernel didn't run"
     assert cuda.device.type == "cuda"
     assert torch.equal(cuda.cpu(), cpu)
 
@@ -60,10 +60,18 @@ def test_cuda_matches_cpu(shape):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("projection_type", ["normal", "rademacher"])
-def test_cuda_without_kernel_matches_kernel(monkeypatch, projection_type):
+def test_cuda_falls_back_when_the_kernel_fails(monkeypatch, projection_type):
     fused = random_matrix("layer/left", 64, 13824, "cuda", projection_type)
-    monkeypatch.setattr(projection_matrix, "_kernels_failed", True)
+    assert not projection_matrix._kernels_failed
+    # Restored after the test, which the fallback sets to True.
+    monkeypatch.setattr(projection_matrix, "_kernels_failed", False)
+
+    def broken(_):
+        raise RuntimeError("no compiler")
+
+    monkeypatch.setattr(projection_matrix, "_kernels", broken)
     fallback = random_matrix("layer/left", 64, 13824, "cuda", projection_type)
+    assert projection_matrix._kernels_failed
     assert fallback.device.type == "cuda"
     torch.testing.assert_close(fallback, fused, rtol=0, atol=2e-6)
 
@@ -76,9 +84,7 @@ def test_normal_entries_are_standard_normal():
     assert kurtosis.item() == pytest.approx(3.0, abs=0.02)
     for s in (2, 3, 4):
         expected = math.erfc(s / math.sqrt(2))
-        assert (z.abs() > s).double().mean().item() == pytest.approx(
-            expected, rel=0.1
-        )
+        assert (z.abs() > s).double().mean().item() == pytest.approx(expected, rel=0.1)
 
 
 @pytest.mark.parametrize("projection_type", ["normal", "rademacher"])
@@ -131,6 +137,18 @@ def test_collector_rejects_old_projected_processor(tmp_path, model, dataset):
             processor=GradientProcessor.load(tmp_path),
             skip_index=True,
         )
+
+
+def test_mixing_rejects_old_projected_hessians(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "bergson.process_grads.assert_autocorrelation_hessian", lambda path: None
+    )
+    old, new = tmp_path / "old", tmp_path / "new"
+    _save_old_processor(old, projection_dim=8)
+    GradientProcessor(projection_dim=8).save(new)
+    for query, index in [(new, old), (old, new)]:
+        with pytest.raises(ValueError, match="Rebuild the index"):
+            mix_autocorrelation_matrices(query, index, tmp_path / "mixed")
 
 
 def test_scoring_rejects_old_projected_query(tmp_path):

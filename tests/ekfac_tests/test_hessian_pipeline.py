@@ -15,6 +15,24 @@ from bergson.config import (
 from bergson.hessians.pipeline import hessian_pipeline
 
 
+def test_hessian_pipeline_rejects_resumed_query_from_before_projection_version(
+    tmp_path,
+):
+    """Earlier versions saved no projection version with the transformed query,
+    so it can't be checked against the index."""
+    run = tmp_path / "run"
+    for step in ["query", "hessian/kfac", "kfac_query"]:
+        (run / step).mkdir(parents=True)
+    with pytest.raises(ValueError, match="earlier version of bergson"):
+        hessian_pipeline(
+            IndexConfig(run_path=str(run), projection_dim=16),
+            HessianConfig(method="kfac"),
+            ScoreConfig(),
+            PreprocessConfig(),
+            HessianPipelineConfig(resume=True),
+        )
+
+
 def test_hessian_pipeline_rejects_unit_normalize(tmp_path):
     """Cosine similarity (unit_normalize) is not supported with the
     Kronecker-factored Hessians hessian_pipeline fits and applies."""

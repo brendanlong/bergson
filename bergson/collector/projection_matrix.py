@@ -65,7 +65,7 @@ _RADEMACHER_KERNEL = (
 }
 """
 )
-_kernels: dict[str, Callable] = {}
+_jit_fns: dict[str, Callable] = {}
 _kernels_failed = False
 
 
@@ -87,12 +87,16 @@ def random_matrix(
 
     device = torch.device(device)
     k1, k2 = _keys(identifier)
-    if device.type == "cuda":
-        kernel = _kernel(projection_type)
-        if kernel is not None:
-            rows = torch.arange(m, dtype=torch.int32, device=device)[:, None]
-            cols = torch.arange(n, dtype=torch.int32, device=device)[None, :]
-            return kernel(rows, cols, cols=n, k1=k1, k2=k2).view(torch.float32)
+    if device.type == "cuda" and not _kernels_failed:
+        rows = torch.arange(m, dtype=torch.int32, device=device)[:, None]
+        cols = torch.arange(n, dtype=torch.int32, device=device)[None, :]
+        try:
+            A = _kernels(projection_type)(rows, cols, cols=n, k1=k1, k2=k2)
+            return A.view(torch.float32)
+        except torch.OutOfMemoryError:
+            raise
+        except Exception as e:
+            _disable_kernels(e)
 
     if projection_type == "normal":
         A = _normal_cpu(k1, k2, m * n)
@@ -109,32 +113,24 @@ def _keys(identifier: str) -> tuple[int, int]:
     )
 
 
-def _kernel(projection_type: str) -> Callable | None:
-    """The fused CUDA/ROCm kernel, or ``None`` if it can't be compiled here."""
-    global _kernels_failed
-    if _kernels_failed:
-        return None
-    if not _kernels:
-        try:
-            from torch.cuda.jiterator import _create_jit_fn
+def _kernels(projection_type: str) -> Callable:
+    """The fused CUDA/ROCm kernel, compiled for each device on first use."""
+    if not _jit_fns:
+        from torch.cuda.jiterator import _create_jit_fn
 
-            _kernels["normal"] = _create_jit_fn(_NORMAL_KERNEL, cols=0, k1=0, k2=0)
-            _kernels["rademacher"] = _create_jit_fn(
-                _RADEMACHER_KERNEL, cols=0, k1=0, k2=0
-            )
-            # Compile now so a failure falls back instead of surfacing later.
-            one = torch.zeros(1, 1, dtype=torch.int32, device="cuda")
-            for kernel in _kernels.values():
-                kernel(one, one, cols=1, k1=0, k2=0)
-        except Exception as e:
-            _kernels.clear()
-            _kernels_failed = True
-            logger.warning(
-                f"Couldn't compile the projection matrix kernel ({e}); generating "
-                "projection matrices on the CPU instead."
-            )
-            return None
-    return _kernels[projection_type]
+        _jit_fns["normal"] = _create_jit_fn(_NORMAL_KERNEL, cols=0, k1=0, k2=0)
+        _jit_fns["rademacher"] = _create_jit_fn(_RADEMACHER_KERNEL, cols=0, k1=0, k2=0)
+    return _jit_fns[projection_type]
+
+
+def _disable_kernels(e: Exception) -> None:
+    # The CPU path computes the same values, so falling back only costs speed.
+    global _kernels_failed
+    _kernels_failed = True
+    logger.warning(
+        f"Couldn't run the projection matrix kernel ({e}); generating projection "
+        "matrices on the CPU instead."
+    )
 
 
 def _hash_(x: Tensor, k1: int, k2: int) -> Tensor:
@@ -165,7 +161,7 @@ def _lowbias32_(x: Tensor, tmp: Tensor) -> None:
 def _normal_cpu(k1: int, k2: int, numel: int) -> Tensor:
     """Entries ``2p`` and ``2p + 1`` share a Box-Muller pair built from the
     hashes of ``2p`` and ``2p + 1``."""
-    out = torch.empty(numel)
+    out = torch.empty(numel, dtype=torch.float32)
     step = 2 * _CPU_PAIRS
     for lo in range(0, numel, step):
         hi = min(numel, lo + step)
@@ -184,7 +180,7 @@ def _normal_cpu(k1: int, k2: int, numel: int) -> Tensor:
 
 def _rademacher_cpu(k1: int, k2: int, numel: int) -> Tensor:
     """Entry ``i`` is bit ``i % 32`` of the hash of ``i // 32``."""
-    out = torch.empty(numel)
+    out = torch.empty(numel, dtype=torch.float32)
     shifts = torch.arange(32, dtype=torch.int32)
     step = 32 * _CPU_WORDS
     for lo in range(0, numel, step):

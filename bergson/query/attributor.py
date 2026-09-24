@@ -69,6 +69,7 @@ class Attributor:
 
         # Load the gradient processor
         self.processor = GradientProcessor.load(index_path, map_location=device)
+        self.processor.check_projection_version(index_path)
 
         # Set `hessian_path` to enable preconditioning. Two-sided
         # preconditioning (H^(-1/2) on index as well as query) is

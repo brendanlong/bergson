@@ -79,6 +79,30 @@ PROJECTION_VERSION = 2
 PyTorch's random number generators, whose output depends on the device."""
 
 
+def check_saved_projection_version(path: Path | str) -> None:
+    """``GradientProcessor.check_projection_version`` for the processor saved at
+    ``path``, reading only its config."""
+    with (Path(path) / "processor_config.yaml").open() as f:
+        cfg = yaml.safe_load(f)
+    _check_projection_version(
+        cfg.get("projection_dim"), cfg.get("projection_version", 1), path
+    )
+
+
+def _check_projection_version(
+    projection_dim: int | None, projection_version: int, path: Path | str | None
+) -> None:
+    if not projection_dim or projection_version == PROJECTION_VERSION:
+        return
+    where = f" at {path}" if path is not None else ""
+    raise ValueError(
+        f"The index{where} was projected with version {projection_version} "
+        f"random projection matrices, but this version of bergson generates "
+        f"version {PROJECTION_VERSION}, so new projections wouldn't match it. "
+        "Rebuild the index."
+    )
+
+
 @dataclass
 class GradientProcessor:
     """Configuration for processing and compressing gradients."""
@@ -226,15 +250,7 @@ class GradientProcessor:
     def check_projection_version(self, path: Path | str | None = None) -> None:
         """Raise if these gradients were projected with matrices this version of
         bergson can't reproduce."""
-        if not self.projection_dim or self.projection_version == PROJECTION_VERSION:
-            return
-        where = f" at {path}" if path is not None else ""
-        raise ValueError(
-            f"The index{where} was projected with version {self.projection_version} "
-            f"random projection matrices, but this version of bergson generates "
-            f"version {PROJECTION_VERSION}, so new projections wouldn't match it. "
-            "Rebuild the index."
-        )
+        _check_projection_version(self.projection_dim, self.projection_version, path)
 
     def save(self, path: Path):
         """

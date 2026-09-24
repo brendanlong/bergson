@@ -2,6 +2,7 @@ import shutil
 import time
 from contextlib import contextmanager
 from copy import deepcopy
+from pathlib import Path
 
 from ..build import build_query
 from ..cli.commands import Score
@@ -131,6 +132,17 @@ def hessian_pipeline(
         )
         if index_cfg.distributed.rank == 0:
             shutil.move(ekfac_cfg.run_path, transformed_query_path)
+    elif (
+        index_cfg.projection_dim
+        and not Path(transformed_query_path, "processor_config.yaml").exists()
+    ):
+        # Scoring checks the saved projection version, but earlier versions of
+        # bergson didn't save one here.
+        raise ValueError(
+            f"{transformed_query_path} was projected by an earlier version of "
+            "bergson whose random projections can't be reproduced. Delete it and "
+            "rerun."
+        )
 
     # ── Step 4: Score training examples ───────────────────────────────────
     print("Step 4/4: Scoring training data against transformed query...")
