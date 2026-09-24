@@ -129,6 +129,18 @@ def test_projection_matrix_is_deterministic_in_identifier():
     assert math.isclose(a.pow(2).mean().item(), 1.0 / 16, rel_tol=0.1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("projection_type", ["rademacher", "normal"])
+def test_projection_matrix_does_not_depend_on_device(projection_type):
+    """An index and query built on different devices must use the same matrix."""
+    args = ("m/left", 1024, 16384, torch.float32)
+    cpu = create_projection_matrix(*args, torch.device("cpu"), projection_type)
+    cuda = create_projection_matrix(*args, torch.device("cuda"), projection_type)
+
+    assert cuda.device.type == "cuda"
+    torch.testing.assert_close(cuda.cpu(), cpu)
+
+
 def test_row_norm_scale_reproduces_legacy_matrices():
     """``row_norm`` gives row-normalized matrices with entry variance 1/n."""
     args = (32, 64, torch.float32, torch.device("cpu"))

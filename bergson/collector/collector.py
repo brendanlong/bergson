@@ -1135,8 +1135,10 @@ def create_projection_matrix(
     seed = int.from_bytes(digest, byteorder="big") % (2**63 - 1)
 
     if projection_type == "normal":
-        prng = torch.Generator(device).manual_seed(seed)
-        A = torch.randn(m, n, device=device, dtype=dtype, generator=prng)
+        # Generate on the CPU: CUDA's generator gives different numbers on
+        # different GPU models for the same seed.
+        prng = torch.Generator().manual_seed(seed)
+        A = torch.randn(m, n, dtype=dtype, generator=prng).to(device)
     elif projection_type == "rademacher":
         numpy_rng = np.random.Generator(np.random.PCG64(seed))
         random_bytes = numpy_rng.bytes((m * n + 7) // 8)
