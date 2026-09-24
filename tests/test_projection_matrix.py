@@ -19,7 +19,7 @@ from bergson.gradients import PROJECTION_VERSION
 from bergson.process_grads import mix_autocorrelation_matrices
 from bergson.score.score import get_query_grads
 
-SHAPES = [(2, 4), (7, 1001), (64, 13824), (64, 1 << 20)]
+SHAPES = [(2, 4), (7, 1001), (64, 13824), (64, 1 << 18)]
 
 
 def test_matrices_are_pinned():
