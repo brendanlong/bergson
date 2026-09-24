@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 from datasets import Dataset
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from bergson import (
     CollectorComputer,
@@ -25,7 +26,8 @@ from bergson.data import (
     create_token_index,
     load_scores,
 )
-from bergson.score.score_writer import MemmapTokenScoreWriter
+from bergson.gradients import AdafactorNormalizer
+from bergson.score.score_writer import InMemoryTokenScoreWriter, MemmapTokenScoreWriter
 from bergson.score.scorer import Scorer
 from bergson.utils.utils import get_gradient_dtype
 
@@ -1068,3 +1070,61 @@ def test_masked_prompt_token_grads_cover_all_positions(tmp_path, model):
             f"ex {ex}: expected a substantial prompt-position contribution, got "
             f"max fraction {max_prompt_frac:.4f}"
         )
+
+
+@pytest.mark.parametrize("normalizer", ["none", "adafactor"])
+@pytest.mark.parametrize("unit_normalize", [False, True])
+@pytest.mark.parametrize("num_queries", [3, 64])
+def test_token_scores_from_factors_match_full_gradients(
+    tmp_path, dataset, normalizer, unit_normalize, num_queries
+):
+    """Scoring each token from its gradient's factors gives the same scores as
+    forming the full gradient, with and without bias columns and normalizers."""
+    config = AutoConfig.from_pretrained("trl-internal-testing/tiny-GPTNeoXForCausalLM")
+    torch.manual_seed(0)
+    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float32)
+
+    normalizers = {}
+    if normalizer == "adafactor":
+        for name, module in model.base_model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                normalizers[name] = AdafactorNormalizer(
+                    row=torch.rand(module.out_features) + 0.5,
+                    col=torch.rand(module.in_features) + 0.5,
+                    bias_avg_sq=torch.rand(module.out_features) + 0.5,
+                )
+    processor = GradientProcessor(normalizers=normalizers, include_bias=True)
+    cfg = IndexConfig(run_path=str(tmp_path), attribute_tokens=True)
+
+    shapes = GradientCollector(
+        model.base_model, data=dataset, cfg=cfg, processor=processor
+    ).shapes()
+    assert any(s[1] == model.base_model.config.hidden_size + 1 for s in shapes.values())
+    query_grads = {m: torch.randn(num_queries, math.prod(s)) for m, s in shapes.items()}
+
+    def token_scores(factored: bool) -> torch.Tensor:
+        writer = InMemoryTokenScoreWriter(dataset, num_queries)
+        scorer = Scorer(
+            query_grads=query_grads,
+            modules=list(shapes),
+            writer=writer,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            unit_normalize=unit_normalize,
+            attribute_tokens=True,
+        )
+        collector = GradientCollector(
+            model.base_model,
+            data=dataset,
+            cfg=cfg,
+            processor=processor,
+            scorer=scorer,
+        )
+        assert collector.score_token_factors
+        collector.score_token_factors = factored
+        CollectorComputer(
+            model, dataset, collector=collector, cfg=cfg
+        ).run_with_collector_hooks()
+        return torch.cat(writer.scores)
+
+    torch.testing.assert_close(token_scores(True), token_scores(False))

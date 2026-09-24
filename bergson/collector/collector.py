@@ -599,6 +599,34 @@ class HookCollectorBase(ContextDecorator, ABC):
         # right projection: [..., p, 1] * [p] → [..., p, p]
         return P + bias_grad.unsqueeze(-1) * a_projection[i]
 
+    def _token_gradient_factors(
+        self, module: nn.Module, g: Float[Tensor, "N S O"]
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
+        """Return ``(g, a, bias_grad)`` for each collected position, whose
+        gradient is ``cat([g ⊗ a, bias_grad], -1)``, without forming the outer
+        product.
+
+        Only valid without projection or Adam normalization.
+        """
+        a = module._inputs  # [N, S, I]
+        assert isinstance(a, torch.Tensor), "Activation cache missing for module"
+        normalizer = self.normalizer_for(assert_type(str, module._name))
+
+        bias_grad = None
+        if module._collect_bias:
+            if isinstance(normalizer, AdafactorNormalizer):
+                bias_grad = normalizer.normalize_bias(g)
+            else:
+                bias_grad = g
+
+        if isinstance(normalizer, AdafactorNormalizer):
+            g_factor = normalizer.row.add(1e-30)
+            g_factor = g_factor.mean().sqrt() * g_factor.rsqrt()
+            g = g * g_factor.type_as(g)
+
+        mask = self._current_collection_mask
+        return g[mask], a[mask], bias_grad[mask] if bias_grad is not None else None
+
     def _compute_gradient(self, module: nn.Module, g: Float[Tensor, "N S O"]) -> Tensor:
         """Compute the per-sample (or per-token) module gradient from cached activations
         and the output gradient.

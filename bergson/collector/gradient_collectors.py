@@ -12,6 +12,7 @@ from torch import Tensor
 from bergson.builder import Builder
 from bergson.collector.collector import HookCollectorBase
 from bergson.config import IndexConfig, PreprocessConfig
+from bergson.gradients import AdamNormalizer
 from bergson.score.scorer import Scorer
 from bergson.utils.utils import get_gradient_dtype
 
@@ -80,6 +81,15 @@ class GradientCollector(HookCollectorBase):
         # Compute whether we need to save the index
         self.save_index = self.scorer is None and not self.skip_index
 
+        # The scorer only needs each token gradient's dot product with the
+        # query, which it can take from the factors of the outer product.
+        self.score_token_factors = (
+            isinstance(self.scorer, Scorer)
+            and self.scorer.index_transform is None
+            and self.cfg.attribute_tokens
+            and not self.processor.projection_dim
+        )
+
         if self.save_index:
             grad_sizes = {name: math.prod(s) for name, s in self.shapes().items()}
             self.builder = Builder(
@@ -97,6 +107,16 @@ class GradientCollector(HookCollectorBase):
     def backward_hook(self, module: nn.Module, g: Float[Tensor, "N S O"]):
         """Compute the per-sample gradient and store it for the index."""
         name: str = module._name  # type: ignore[assignment]
+
+        if self.score_token_factors and not isinstance(
+            self.normalizer_for(name), AdamNormalizer
+        ):
+            self.mod_grads[name] = tuple(
+                f.to(dtype=self.save_dtype) if f is not None else None
+                for f in self._token_gradient_factors(module, g)
+            )
+            return
+
         P = self._compute_gradient(module, g)
 
         if self.accumulate_global_projection(name, P):

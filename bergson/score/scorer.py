@@ -5,6 +5,8 @@ from torch import Tensor
 
 from bergson.score.score_writer import ScoreWriter
 
+TokenGradientFactors = tuple[Tensor, Tensor, Tensor | None]
+
 
 class Scorer:
     """
@@ -29,7 +31,7 @@ class Scorer:
         unit_normalize: bool = False,
         score_mode: str = "individual",
         attribute_tokens: bool = False,
-        index_transform: Callable[[dict[str, Tensor]], dict[str, Tensor]] = lambda x: x,
+        index_transform: Callable[[dict[str, Tensor]], dict[str, Tensor]] | None = None,
         query_offset: int = 0,
     ):
         """
@@ -80,27 +82,36 @@ class Scorer:
     def __call__(
         self,
         indices: list[int],
-        mod_grads: dict[str, Tensor],
+        mod_grads: dict[str, Tensor | TokenGradientFactors],
     ):
         """Score a batch of training gradients against all queries."""
         scores = self.score(mod_grads)
         self.writer(indices, scores, query_offset=self.query_offset)
 
     @torch.inference_mode()
-    def score(self, index_grads: dict[str, Tensor]) -> Tensor:
-        """Compute scores for a batch of gradients."""
-        index_grads = self.index_transform(index_grads)
+    def score(self, index_grads: dict[str, Tensor | TokenGradientFactors]) -> Tensor:
+        """Compute scores for a batch of gradients.
+
+        A module's gradients may instead be given as per-token factors
+        ``(g, a, bias_grad)``, which avoids forming each token's [O, I] gradient.
+        """
+        if self.index_transform is not None:
+            index_grads = self.index_transform(index_grads)  # type: ignore[arg-type]
 
         # scores[b, q] = sum_m g_b[m] . q_q[m]; per-module GEMMs avoid
         # materializing a [batch, total_dim] concat of the index gradients
         scores = None
         sq_norm = None
         for m in self.modules:
-            g = index_grads[m].to(self.device, self.dtype, non_blocking=True)
-            part = g @ self.query_grads_t[m]
+            grads = index_grads[m]
+            if isinstance(grads, tuple):
+                part, n = self._score_factors(m, *grads)
+            else:
+                g = grads.to(self.device, self.dtype, non_blocking=True)
+                part = g @ self.query_grads_t[m]
+                n = g.pow(2).sum(dim=1) if self.unit_normalize else None
             scores = part if scores is None else scores.add_(part)
-            if self.unit_normalize:
-                n = g.pow(2).sum(dim=1)
+            if n is not None:
                 sq_norm = n if sq_norm is None else sq_norm.add_(n)
 
         assert scores is not None, "Scorer requires at least one module"
@@ -113,3 +124,42 @@ class Scorer:
             return scores.max(dim=-1, keepdim=True).values
 
         return scores
+
+    def _score_factors(
+        self, m: str, g: Tensor, a: Tensor, bias_grad: Tensor | None
+    ) -> tuple[Tensor, Tensor | None]:
+        """Score gradients ``cat([g ⊗ a, bias_grad], -1)`` against module ``m``'s
+        queries, returning the scores and, if unit normalizing, the squared norms.
+        """
+        g = g.to(self.device, self.dtype, non_blocking=True)  # [T, O]
+        a = a.to(self.device, self.dtype, non_blocking=True)  # [T, I]
+        o, i = g.shape[1], a.shape[1]
+
+        # ‖g ⊗ a‖ = ‖g‖·‖a‖
+        n = g.pow(2).sum(dim=1) * a.pow(2).sum(dim=1) if self.unit_normalize else None
+        if bias_grad is not None:
+            bias_grad = bias_grad.to(self.device, self.dtype, non_blocking=True)
+            if n is not None:
+                n.add_(bias_grad.pow(2).sum(dim=1))
+            # A zero column in a keeps the bias column out of the weight term
+            a = torch.nn.functional.pad(a, (0, 1))
+
+        q_t = self.query_grads_t[m]  # [O * I, Q], with I + 1 for the bias
+        num_queries = q_t.shape[1]
+
+        # Contracting a factor with the queries first builds a [T, Q, min(O, I)]
+        # tensor, which is larger than the [T, O, I] gradients for many queries.
+        if num_queries >= max(o, i):
+            full = g.unsqueeze(-1) * a.unsqueeze(-2)  # [T, O, I]
+            if bias_grad is not None:
+                full[..., -1] = bias_grad
+            return full.flatten(1) @ q_t, n
+
+        q = q_t.T.reshape(num_queries, o, a.shape[1])  # [Q, O, I]
+        if o <= i:
+            part = torch.einsum("to,tqo->tq", g, torch.einsum("qoi,ti->tqo", q, a))
+        else:
+            part = torch.einsum("ti,tqi->tq", a, torch.einsum("qoi,to->tqi", q, g))
+        if bias_grad is not None:
+            part.add_(bias_grad @ q[..., -1].T)
+        return part, n
