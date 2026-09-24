@@ -30,8 +30,8 @@ def test_matrices_are_pinned():
         normal,
         torch.tensor(
             [
-                [1.2229382, 0.7528408, -0.8329613, 0.7298190],
-                [-0.4663235, 1.4072623, -1.0187521, 0.3879673],
+                [-1.0932976, -1.0874549, -0.3873174, -0.4707755],
+                [-1.9625934, 1.6714863, 0.1380329, -0.4476005],
             ]
         ),
         rtol=0,
@@ -39,7 +39,7 @@ def test_matrices_are_pinned():
     )
     rademacher = random_matrix("layer/left", 16, 64, "cpu", "rademacher")
     digest = hashlib.sha256(rademacher.numpy().tobytes()).hexdigest()
-    assert digest == "45963e4eeac702ac79e13489248f0d2c849e7b1bae8efdb8849b3c990911f4ef"
+    assert digest == "2dc4725decc3ec5fe0b9a16ae64c4dabc2abeb35123e3783e40edfbf79d74e5a"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -60,6 +60,36 @@ def test_cuda_matches_cpu(shape):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("projection_type", ["normal", "rademacher"])
+@pytest.mark.parametrize("n", [13824, 13825])
+def test_cuda_bf16_matches_rounded_fp32(projection_type, n):
+    """bf16 matrices come from their own kernel, which writes two entries at a
+    time, so odd widths are cut down from the next even one."""
+    fp32 = random_matrix("layer/left", 64, n, "cuda", projection_type)
+    bf16 = random_matrix("layer/left", 64, n, "cuda", projection_type, torch.bfloat16)
+    assert bf16.dtype == torch.bfloat16 and bf16.shape == (64, n)
+    assert bf16.is_contiguous()
+    cpu = random_matrix("layer/left", 64, n, "cpu", projection_type, torch.bfloat16)
+    if projection_type == "rademacher":
+        assert torch.equal(bf16, fp32.to(torch.bfloat16))
+        assert torch.equal(bf16.cpu(), cpu)
+    else:
+        torch.testing.assert_close(bf16, fp32.to(torch.bfloat16))
+        torch.testing.assert_close(bf16.cpu(), cpu)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("projection_type", ["normal", "rademacher"])
+def test_cuda_generates_other_dtypes_in_slabs(monkeypatch, projection_type):
+    """Narrow dtypes without their own kernel are generated in fp32 slabs."""
+    monkeypatch.setattr(projection_matrix, "_GPU_SLAB", 64 * 1000)
+    fp32 = random_matrix("layer/left", 64, 13824, "cuda", projection_type)
+    fp16 = random_matrix("layer/left", 64, 13824, "cuda", projection_type, torch.half)
+    assert fp16.dtype == torch.half
+    assert torch.equal(fp16, fp32.to(torch.half))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("projection_type", ["normal", "rademacher"])
 def test_cuda_falls_back_when_the_kernel_fails(monkeypatch, projection_type):
     fused = random_matrix("layer/left", 64, 13824, "cuda", projection_type)
     assert not projection_matrix._kernels_failed
@@ -69,11 +99,20 @@ def test_cuda_falls_back_when_the_kernel_fails(monkeypatch, projection_type):
     def broken(_):
         raise RuntimeError("no compiler")
 
-    monkeypatch.setattr(projection_matrix, "_kernels", broken)
+    monkeypatch.setattr(projection_matrix, "_kernel", broken)
     fallback = random_matrix("layer/left", 64, 13824, "cuda", projection_type)
     assert projection_matrix._kernels_failed
     assert fallback.device.type == "cuda"
     torch.testing.assert_close(fallback, fused, rtol=0, atol=2e-6)
+
+
+@pytest.mark.parametrize("projection_type", ["normal", "rademacher"])
+def test_entries_do_not_depend_on_the_shape(projection_type):
+    """Each entry depends only on its row and column, so matrices of any size
+    agree where they overlap."""
+    big = random_matrix("layer/left", 70, 70001, "cpu", projection_type)
+    small = random_matrix("layer/left", 3, 1001, "cpu", projection_type)
+    assert torch.equal(big[:3, :1001], small)
 
 
 def test_normal_entries_are_standard_normal():
@@ -102,7 +141,7 @@ def test_rejects_unknown_type_and_oversized_matrices():
     with pytest.raises(ValueError, match="Unknown projection type"):
         random_matrix("layer/left", 2, 2, "cpu", "uniform")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="2\\^31"):
-        random_matrix("layer/left", 1 << 16, 1 << 15, "cpu", "normal")
+        random_matrix("layer/left", 1, 1 << 31, "cpu", "normal")
 
 
 def _save_old_processor(path, projection_dim):

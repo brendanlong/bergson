@@ -1075,8 +1075,8 @@ def global_projection_blocks(
     for start in range(0, n, cols):
         stop = min(n, start + cols)
         block = random_matrix(
-            f"{identifier}/{start}", m, stop - start, device, projection_type
-        ).to(dtype)
+            f"{identifier}/{start}", m, stop - start, device, projection_type, dtype
+        )
         yield start, stop, block
 
 
@@ -1120,7 +1120,7 @@ def create_projection_matrix(
     projection_scale: Literal["jl", "row_norm"] = "jl",
 ) -> Tensor:
     """Create a projection matrix deterministically based on identifier."""
-    A = random_matrix(identifier, m, n, device, projection_type).to(dtype)
+    A = random_matrix(identifier, m, n, device, projection_type, dtype)
 
     if projection_scale == "row_norm":
         A /= A.norm(dim=1, keepdim=True)
