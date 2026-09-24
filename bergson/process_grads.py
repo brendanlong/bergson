@@ -101,6 +101,7 @@ def mix_autocorrelation_matrices(
         projection_type=q_proc.projection_type,
         projection_target=q_proc.projection_target,
         include_bias=q_proc.include_bias,
+        projection_version=q_proc.projection_version,
     )
     mixed_proc.save(output_path)
 

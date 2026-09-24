@@ -22,6 +22,7 @@ from bergson.distributed import (
     launch_distributed_run,
     parent_barrier,
 )
+from bergson.gradients import GradientProcessor
 from bergson.hessians.preconditioner import (
     DensePreconditioner,
     is_factored_hessian,
@@ -76,6 +77,11 @@ def get_query_grads(
         metadata = json.load(f)
         grad_sizes = metadata["grad_sizes"]
         target_modules = list(grad_sizes)
+
+    if (query_path / "processor_config.yaml").exists():
+        GradientProcessor.load(query_path, skip_hessians=True).check_projection_version(
+            query_path
+        )
 
     preprocess_cfg = (
         load_subconfig(query_path, "preprocess_cfg", PreprocessConfig)

@@ -74,6 +74,11 @@ class Normalizer(ABC):
         }
 
 
+PROJECTION_VERSION = 2
+"""Version of the random projection matrices. Version 1 matrices came from
+PyTorch's random number generators, whose output depends on the device."""
+
+
 @dataclass
 class GradientProcessor:
     """Configuration for processing and compressing gradients."""
@@ -131,6 +136,9 @@ class GradientProcessor:
     projection_seed: int | None = None
     """Seed of the random projection."""
 
+    projection_version: int = PROJECTION_VERSION
+    """Version of the random projection matrices. See ``PROJECTION_VERSION``."""
+
     def __post_init__(self):
         self._projection_matrices: dict[
             tuple[str, Literal["left", "right", "single"], torch.device], Tensor
@@ -171,6 +179,8 @@ class GradientProcessor:
             cfg["include_bias"] = False
         if "projection_scale" not in cfg:
             cfg["projection_scale"] = "row_norm"
+        if "projection_version" not in cfg:
+            cfg["projection_version"] = 1
         # Defensive: rename any legacy preconditioner* keys that may appear in
         # configs saved by older versions of this code.
         for legacy_key in list(cfg.keys()):
@@ -211,6 +221,19 @@ class GradientProcessor:
             hessians=hessians,
             hessians_eigen=hessians_eigen,
             **cfg,
+        )
+
+    def check_projection_version(self, path: Path | str | None = None) -> None:
+        """Raise if these gradients were projected with matrices this version of
+        bergson can't reproduce."""
+        if not self.projection_dim or self.projection_version == PROJECTION_VERSION:
+            return
+        where = f" at {path}" if path is not None else ""
+        raise ValueError(
+            f"The index{where} was projected with version {self.projection_version} "
+            f"random projection matrices, but this version of bergson generates "
+            f"version {PROJECTION_VERSION}, so new projections wouldn't match it. "
+            "Rebuild the index."
         )
 
     def save(self, path: Path):

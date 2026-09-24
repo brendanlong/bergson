@@ -541,6 +541,7 @@ def load_preconditioner(
     # Dense: load the saved processor on CPU; from_processor moves each Gram to
     # device as it inverts it, so only one dense matrix is on the device at a time.
     processor = GradientProcessor.load(Path(hessian_path), map_location="cpu")
+    processor.check_projection_version(hessian_path)
     if "joint" in processor.hessians:
         return JointDensePreconditioner.from_processor(
             processor,
