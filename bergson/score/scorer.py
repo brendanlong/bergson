@@ -157,9 +157,9 @@ class Scorer:
 
         q = q_t.T.reshape(num_queries, o, a.shape[1])  # [Q, O, I]
         if o <= i:
-            part = torch.einsum("to,tqo->tq", g, torch.einsum("qoi,ti->tqo", q, a))
+            part = torch.einsum("qot,to->tq", q @ a.T, g)  # via [Q, O, T]
         else:
-            part = torch.einsum("ti,tqi->tq", a, torch.einsum("qoi,to->tqi", q, g))
+            part = torch.einsum("qti,ti->tq", g @ q, a)  # via [Q, T, I]
         if bias_grad is not None:
             part.add_(bias_grad @ q[..., -1].T)
         return part, n

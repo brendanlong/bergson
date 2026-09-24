@@ -36,6 +36,7 @@ from bergson.gradients import (
     GradientProcessor,
     LayerAdapter,
 )
+from bergson.score.scorer import TokenGradientFactors
 from bergson.utils.logger import get_logger
 from bergson.utils.peft import set_peft_enabled
 from bergson.utils.utils import assert_type
@@ -601,7 +602,7 @@ class HookCollectorBase(ContextDecorator, ABC):
 
     def _token_gradient_factors(
         self, module: nn.Module, g: Float[Tensor, "N S O"]
-    ) -> tuple[Tensor, Tensor, Tensor | None]:
+    ) -> TokenGradientFactors:
         """Return ``(g, a, bias_grad)`` for each collected position, whose
         gradient is ``cat([g ⊗ a, bias_grad], -1)``, without forming the outer
         product.

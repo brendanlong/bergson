@@ -82,11 +82,12 @@ class GradientCollector(HookCollectorBase):
         self.save_index = self.scorer is None and not self.skip_index
 
         # The scorer only needs each token gradient's dot product with the
-        # query, which it can take from the factors of the outer product.
+        # query, which it can take from the factors of the outer product unless
+        # the gradient is projected or transformed first.
         self.score_token_factors = (
             isinstance(self.scorer, Scorer)
             and self.scorer.index_transform is None
-            and self.cfg.attribute_tokens
+            and self.attribute_tokens
             and not self.processor.projection_dim
         )
 
@@ -111,10 +112,7 @@ class GradientCollector(HookCollectorBase):
         if self.score_token_factors and not isinstance(
             self.normalizer_for(name), AdamNormalizer
         ):
-            self.mod_grads[name] = tuple(
-                f.to(dtype=self.save_dtype) if f is not None else None
-                for f in self._token_gradient_factors(module, g)
-            )
+            self.mod_grads[name] = self._token_gradient_factors(module, g)
             return
 
         P = self._compute_gradient(module, g)

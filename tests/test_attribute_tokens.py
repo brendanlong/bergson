@@ -19,7 +19,7 @@ from bergson import (
 )
 from bergson.builder import Builder
 from bergson.collector.gradient_collectors import GradientCollector
-from bergson.config import IndexConfig, PreprocessConfig
+from bergson.config import AttentionConfig, IndexConfig, PreprocessConfig
 from bergson.data import (
     allocate_batches,
     compute_num_token_grads,
@@ -1074,6 +1074,8 @@ def test_masked_prompt_token_grads_cover_all_positions(tmp_path, model):
 
 @pytest.mark.parametrize("normalizer", ["none", "adafactor"])
 @pytest.mark.parametrize("unit_normalize", [False, True])
+# The tiny model's modules have at most 32 inputs or outputs, so 3 queries
+# score from the factors and 64 fall back to forming the full gradients.
 @pytest.mark.parametrize("num_queries", [3, 64])
 def test_token_scores_from_factors_match_full_gradients(
     tmp_path, dataset, normalizer, unit_normalize, num_queries
@@ -1083,6 +1085,7 @@ def test_token_scores_from_factors_match_full_gradients(
     config = AutoConfig.from_pretrained("trl-internal-testing/tiny-GPTNeoXForCausalLM")
     torch.manual_seed(0)
     model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float32)
+    model.base_model.layers[0].attention.dense.bias = None
 
     normalizers = {}
     if normalizer == "adafactor":
@@ -1095,36 +1098,53 @@ def test_token_scores_from_factors_match_full_gradients(
                 )
     processor = GradientProcessor(normalizers=normalizers, include_bias=True)
     cfg = IndexConfig(run_path=str(tmp_path), attribute_tokens=True)
-
-    shapes = GradientCollector(
-        model.base_model, data=dataset, cfg=cfg, processor=processor
-    ).shapes()
-    assert any(s[1] == model.base_model.config.hidden_size + 1 for s in shapes.values())
-    query_grads = {m: torch.randn(num_queries, math.prod(s)) for m, s in shapes.items()}
-
-    def token_scores(factored: bool) -> torch.Tensor:
-        writer = InMemoryTokenScoreWriter(dataset, num_queries)
-        scorer = Scorer(
-            query_grads=query_grads,
-            modules=list(shapes),
-            writer=writer,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            unit_normalize=unit_normalize,
-            attribute_tokens=True,
+    attention_cfgs = {
+        "layers.0.attention.query_key_value": AttentionConfig(
+            num_heads=4, head_size=6, head_dim=2
         )
-        collector = GradientCollector(
+    }
+
+    def make_collector(processor, scorer=None) -> GradientCollector:
+        return GradientCollector(
             model.base_model,
             data=dataset,
             cfg=cfg,
             processor=processor,
             scorer=scorer,
+            attention_cfgs=attention_cfgs,
         )
+
+    shapes = make_collector(processor).shapes()
+    query_grads = {m: torch.randn(num_queries, math.prod(s)) for m, s in shapes.items()}
+
+    def make_scorer(**kwargs) -> Scorer:
+        return Scorer(
+            query_grads=query_grads,
+            modules=list(shapes),
+            writer=InMemoryTokenScoreWriter(dataset, num_queries),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            unit_normalize=unit_normalize,
+            attribute_tokens=True,
+            **kwargs,
+        )
+
+    def token_scores(factored: bool) -> torch.Tensor:
+        scorer = make_scorer()
+        collector = make_collector(processor, scorer)
         assert collector.score_token_factors
         collector.score_token_factors = factored
         CollectorComputer(
             model, dataset, collector=collector, cfg=cfg
         ).run_with_collector_hooks()
-        return torch.cat(writer.scores)
+        assert isinstance(scorer.writer, InMemoryTokenScoreWriter)
+        return torch.cat(scorer.writer.scores)
 
     torch.testing.assert_close(token_scores(True), token_scores(False))
+
+    assert not make_collector(
+        processor, make_scorer(index_transform=lambda x: x)
+    ).score_token_factors
+    assert not make_collector(
+        GradientProcessor(projection_dim=4), make_scorer()
+    ).score_token_factors
