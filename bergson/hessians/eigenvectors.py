@@ -277,7 +277,7 @@ def compute_eigendecomposition(
         all_keys = list(f.keys())
         original_dtype = f.get_tensor(all_keys[0]).dtype
         # Get dimensions for fair distribution (columns not sharded, shape[-1]=d)
-        key_dimensions = {key: f.get_tensor(key).shape[-1] for key in all_keys}
+        key_dimensions = {key: f.get_slice(key).get_shape()[-1] for key in all_keys}
 
     # Distribute keys fairly based on O(d³) eigendecomposition cost
     all_assignments = fair_distribute_by_cost(key_dimensions, world_size)
