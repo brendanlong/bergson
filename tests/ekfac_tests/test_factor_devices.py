@@ -4,15 +4,26 @@ model: the factor stores are the same."""
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import load_file
 
-from bergson.config import DataConfig, HessianConfig, IndexConfig
+from bergson.config import (
+    DataConfig,
+    HessianConfig,
+    HessianPipelineConfig,
+    IndexConfig,
+    PreprocessConfig,
+    QuerySetConfig,
+    ScoreConfig,
+)
+from bergson.data import load_scores
 from bergson.hessians.hessian_approximations import (
     FACTOR_SUBDIRS,
     approximate_hessians,
 )
+from bergson.hessians.pipeline import hessian_pipeline
 from bergson.hessians.sharded_computation import assign_factor_devices
 
 
@@ -73,3 +84,43 @@ def test_factor_devices_match_default(tmp_path: Path):
             torch.testing.assert_close(
                 actual, expected, rtol=0, atol=tolerance * expected.abs().max()
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_factor_devices_pipeline_scores_match_default(tmp_path: Path):
+    def scores(name: str, factor_devices: list[str]) -> np.ndarray:
+        run = tmp_path / name
+        data = DataConfig(
+            dataset="NeelNanda/pile-10k", split="train[:8]", truncation=True
+        )
+        hessian_pipeline(
+            IndexConfig(
+                run_path=str(run),
+                model="EleutherAI/pythia-14m",
+                data=data,
+                token_batch_size=512,
+                precision="fp32",
+                filter_modules="embed_out",
+            ),
+            HessianConfig(
+                method="kfac",
+                ev_correction=True,
+                use_dataset_labels=True,
+                factor_devices=factor_devices,
+            ),
+            ScoreConfig(batch_size=64),
+            PreprocessConfig(),
+            HessianPipelineConfig(
+                query=QuerySetConfig(
+                    data=DataConfig(
+                        dataset="NeelNanda/pile-10k",
+                        split="train[8:10]",
+                        truncation=True,
+                    ),
+                ),
+            ),
+        )
+        return load_scores(run / "scores")[:][:, 0]
+
+    default, placed = scores("default", []), scores("placed", ["cpu", "cuda:0"])
+    np.testing.assert_allclose(placed, default, rtol=0, atol=1e-3 * abs(default).max())

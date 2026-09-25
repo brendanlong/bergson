@@ -2,6 +2,7 @@ import shutil
 import time
 from contextlib import contextmanager
 from copy import deepcopy
+from dataclasses import replace
 
 from ..build import build_query
 from ..cli.commands import Score
@@ -112,6 +113,13 @@ def hessian_pipeline(
     print(f"Step 3/4: Applying {method} inverse Hessian to mean query gradient...")
     if not _step_complete(transformed_query_path, resume):
         hessian_method_path = f"{hessian_path}/{method}"
+        apply_distributed = index_cfg.distributed
+        apply_partitions = hessian_cfg.module_partitions
+        if hessian_cfg.factor_devices:
+            # The fit wrote a single shard, which only fits on a device in
+            # pieces the size of those it was fitted in.
+            apply_distributed = replace(apply_distributed, nproc_per_node=1)
+            apply_partitions *= len(hessian_cfg.factor_devices)
         # Written to .part and promoted below, so an interrupted apply reruns.
         ekfac_cfg = EkfacConfig(
             hessian_method_path=hessian_method_path,
@@ -121,13 +129,13 @@ def hessian_pipeline(
             projection_dim=index_cfg.projection_dim,
             projection_type=index_cfg.projection_type,
             apply_batch_size=hessian_pipeline_cfg.inversion_cfg.apply_batch_size,
-            module_partitions=hessian_cfg.module_partitions,
+            module_partitions=apply_partitions,
         )
         launch_distributed_run(
             "apply_hessian",
             apply_worker,
             [ekfac_cfg, hessian_pipeline_cfg.inversion_cfg],
-            index_cfg.distributed,
+            apply_distributed,
         )
         if index_cfg.distributed.rank == 0:
             shutil.move(ekfac_cfg.run_path, transformed_query_path)
