@@ -1,6 +1,6 @@
 import gc
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.distributed as dist
@@ -11,7 +11,12 @@ from torch import Tensor
 from tqdm import tqdm
 
 from bergson.collector.collector import HookCollectorBase
-from bergson.hessians.sharded_computation import ShardedMul, shard_bounds
+from bergson.hessians.sharded_computation import (
+    ShardedMul,
+    assign_factor_devices,
+    move_to_factor_device,
+    shard_bounds,
+)
 from bergson.utils.logger import get_logger
 from bergson.utils.utils import (
     assert_type,
@@ -90,6 +95,9 @@ class LambdaCollector(HookCollectorBase):
     gradients, and eigenvectors are cast to this before the rotation and
     squared accumulation, and shards are saved in it."""
 
+    factor_devices: list[str] = field(default_factory=list)
+    """See ``HessianConfig.factor_devices``."""
+
     def setup(self) -> None:
         """Load eigenvectors and initialize storage."""
         self.shard_computer = ShardedMul()
@@ -112,8 +120,19 @@ class LambdaCollector(HookCollectorBase):
         )
 
         # Cast eigenvectors once so the rotations run in the accumulation dtype.
-        self.eigen_a = {k: v.to(self.dtype) for k, v in self.eigen_a.items()}
-        self.eigen_g = {k: v.to(self.dtype) for k, v in self.eigen_g.items()}
+        placement = (
+            assign_factor_devices(self.target_info, self.factor_devices)
+            if self.factor_devices
+            else {}
+        )
+        self.eigen_a = {
+            k: v.to(placement.get(k, v.device), self.dtype)
+            for k, v in self.eigen_a.items()
+        }
+        self.eigen_g = {
+            k: v.to(placement.get(k, v.device), self.dtype)
+            for k, v in self.eigen_g.items()
+        }
 
         # Initialize accumulators
         self.eigenvalue_corrections = {}
@@ -130,8 +149,10 @@ class LambdaCollector(HookCollectorBase):
             a = torch.cat([a, a.new_ones(*a.shape[:-1], 1)], dim=-1)  # [N, S, I+1]
 
         # Transform: a @ eigen_a
+        eigen_a = self.eigen_a[name]
         transformed = self.shard_computer._matmul(
-            vector_nsa=a.to(self.dtype), matrix_cb=self.eigen_a[name]
+            vector_nsa=move_to_factor_device(a, eigen_a, self.dtype),
+            matrix_cb=eigen_a,
         )  # shape [N, S, I]
 
         # Cache for use in backward pass
@@ -143,8 +164,10 @@ class LambdaCollector(HookCollectorBase):
         # g shape: [N, S, O]
 
         # Transform: g @ eigen_g
+        eigen_g = self.eigen_g[name]
         transformed_g = self.shard_computer._matmul(
-            vector_nsa=g.to(self.dtype), matrix_cb=self.eigen_g[name]
+            vector_nsa=move_to_factor_device(g, eigen_g, self.dtype),
+            matrix_cb=eigen_g,
         )  # shape [N, S, O]
 
         # Compute outer product: sum_n (transformed_a_n^T @ transformed_g_n)
@@ -164,6 +187,16 @@ class LambdaCollector(HookCollectorBase):
         start_row, end_row = self.shard_computer.shard_bounds(
             transformed_grad_shard.shape[0]
         )
+
+        # Factor devices have room for the corrections, and a copy to the CPU
+        # would wait for each module's work to finish.
+        if self.factor_devices:
+            update = transformed_grad_shard[start_row:end_row, :]
+            if name in self.eigenvalue_corrections:
+                self.eigenvalue_corrections[name].add_(update)
+            else:
+                self.eigenvalue_corrections[name] = update.contiguous()
+            return
 
         # Accumulate (with CPU offloading for memory efficiency)
         if name not in self.eigenvalue_corrections:

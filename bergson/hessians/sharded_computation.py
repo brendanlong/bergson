@@ -21,6 +21,32 @@ def shard_bounds(dim: int, rank: int, world_size: int) -> tuple[int, int]:
     return start, start + base
 
 
+def assign_factor_devices(
+    target_info: dict[str, tuple[torch.device, torch.Size, bool]],
+    devices: list[str],
+) -> dict[str, torch.device]:
+    """Place each module's factors on one of ``devices``, largest first onto the
+    device holding the fewest elements so far."""
+    load = {torch.device(d): 0 for d in devices}
+
+    def numel(name: str) -> int:
+        _, (out_dim, in_dim), collect_bias = target_info[name]
+        return (in_dim + collect_bias) ** 2 + out_dim**2
+
+    placement = {}
+    for name in sorted(target_info, key=numel, reverse=True):
+        device = min(load, key=load.__getitem__)
+        placement[name] = device
+        load[device] += numel(name)
+    return placement
+
+
+def move_to_factor_device(x: Tensor, factor: Tensor, dtype: torch.dtype) -> Tensor:
+    """Move ``x`` to ``factor``'s device without waiting for the copy, which is
+    only safe when the destination is a GPU."""
+    return x.to(factor.device, dtype, non_blocking=factor.device.type == "cuda")
+
+
 class ShardedMul:
     """Distributed-aware linear-algebra primitives for applying a factored Hessian:
     eigenbasis rotations and in-place eigenvalue scaling.
@@ -50,23 +76,25 @@ class ShardedMul:
         gradient_covariance_dict: dict,
         dtype: torch.dtype,
         target_info: dict[str, tuple[torch.device, torch.Size, bool]],
+        factor_devices: dict[str, torch.device] | None = None,
     ):
         """Initialize the covariance matrices for activations and gradients."""
 
-        for name, (device, weight_shape, collect_bias) in target_info.items():
+        for name, (_, weight_shape, collect_bias) in target_info.items():
+            device = factor_devices[name] if factor_devices else self.device
             # Activation covariance A^T A has shape [in_dim, in_dim], or
             # [in + 1, in + 1] when the bias is collected.
             in_dim = weight_shape[1] + (1 if collect_bias else 0)
             in_start, in_end = self.shard_bounds(in_dim)
             activation_covariance_dict[name] = torch.zeros(
-                (in_end - in_start, in_dim), device=self.device, dtype=dtype
+                (in_end - in_start, in_dim), device=device, dtype=dtype
             )
 
             # Gradient covariance G^T G has shape [out_dim, out_dim]
             out_dim = weight_shape[0]
             out_start, out_end = self.shard_bounds(out_dim)
             gradient_covariance_dict[name] = torch.zeros(
-                (out_end - out_start, out_dim), device=self.device, dtype=dtype
+                (out_end - out_start, out_dim), device=device, dtype=dtype
             )
 
     def _matmul(

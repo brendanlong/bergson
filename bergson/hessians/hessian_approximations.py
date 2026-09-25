@@ -3,6 +3,7 @@ import os
 import shutil
 import warnings
 from contextlib import ExitStack
+from dataclasses import replace
 
 import torch
 import torch.distributed as dist
@@ -153,6 +154,16 @@ def approximate_hessians(
             "intentional."
         )
 
+    distributed = index_cfg.distributed
+    if hessian_cfg.factor_devices:
+        if hessian_cfg.method != "kfac":
+            raise ValueError(
+                f"factor_devices supports method kfac, got {hessian_cfg.method}"
+            )
+        if distributed.nnode > 1:
+            raise ValueError("factor_devices needs a single node")
+        distributed = replace(distributed, nproc_per_node=1)
+
     if index_cfg.debug:
         setup_reproducibility()
     index_cfg.partial_run_path.mkdir(parents=True, exist_ok=True)
@@ -163,7 +174,7 @@ def approximate_hessians(
         "hessian",
         hessian_worker,
         [index_cfg, hessian_cfg, ds, do_eigendecomposition],
-        index_cfg.distributed,
+        distributed,
     )
 
     rank = index_cfg.distributed.rank
@@ -395,6 +406,8 @@ def collect_hessians(
         "processor": GradientProcessor(include_bias=index_cfg.include_bias),
         "dtype": hessian_dtype,
     }
+    if hessian_cfg.factor_devices:
+        collector_args["factor_devices"] = hessian_cfg.factor_devices
     desc = f"Approximating Hessians with {hessian_cfg.method}"
     if ev_correction:
         collector = LambdaCollector(

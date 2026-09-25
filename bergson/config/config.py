@@ -952,6 +952,10 @@ class HessianConfig(Serializable):
     """Fit the factored methods in this many module groups, one pass per group,
     merging the shard files afterwards; raise it when the factors do not fit."""
 
+    factor_devices: list[str] = field(default_factory=list)
+    """Devices that hold the factored methods' factors, each module's on one of
+    them; the fit then runs in one process with the model on the first GPU."""
+
 
 @dataclass
 class HessianPipelineConfig:
