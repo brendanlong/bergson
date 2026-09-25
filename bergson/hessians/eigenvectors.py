@@ -106,34 +106,30 @@ class LambdaCollector(HookCollectorBase):
 
         eigen_src = self.eigen_path or self.path
 
-        # Load precomputed eigenvectors
-        self.eigen_a = load_file(
-            os.path.join(
-                eigen_src, f"eigen_activation_sharded/shard_{self.rank}.safetensors"
-            ),
-            device=self.device,
-        )
-        self.eigen_g = load_file(
-            os.path.join(
-                eigen_src, f"eigen_gradient_sharded/shard_{self.rank}.safetensors"
-            ),
-            device=self.device,
-        )
-
-        # Cast eigenvectors once so the rotations run in the accumulation dtype.
         placement = (
             assign_factor_devices(self.target_info, self.factor_devices)
             if self.factor_devices
-            else {}
+            else None
         )
-        self.eigen_a = {
-            k: v.to(placement.get(k, v.device), self.dtype)
-            for k, v in self.eigen_a.items()
-        }
-        self.eigen_g = {
-            k: v.to(placement.get(k, v.device), self.dtype)
-            for k, v in self.eigen_g.items()
-        }
+
+        def load(subdir: str) -> dict[str, Tensor]:
+            """Load this rank's eigenvectors, cast once so the rotations run in
+            the accumulation dtype."""
+            path = os.path.join(eigen_src, subdir, f"shard_{self.rank}.safetensors")
+            if placement is None:
+                return {
+                    k: v.to(self.dtype)
+                    for k, v in load_file(path, device=self.device).items()
+                }
+
+            # Together they need not fit on any one device.
+            with safe_open(path, framework="pt", device="cpu") as f:
+                return {
+                    k: f.get_tensor(k).to(placement[k], self.dtype) for k in f.keys()
+                }
+
+        self.eigen_a = load("eigen_activation_sharded")
+        self.eigen_g = load("eigen_gradient_sharded")
 
         # Initialize accumulators
         self.eigenvalue_corrections = {}
