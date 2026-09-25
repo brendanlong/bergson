@@ -396,6 +396,35 @@ def test_compute_hessian_h_inv():
     assert load_preconditioner(None, power=-1, device=torch.device("cpu")) is None
 
 
+@pytest.mark.parametrize("unit_normalize", [False, True])
+@pytest.mark.parametrize("score_mode", ["individual", "nearest"])
+def test_streaming_scorer_matches_batch_scoring(unit_normalize, score_mode):
+    """Scoring each module as it arrives matches scoring the whole batch."""
+    torch.manual_seed(0)
+    queries = {"a": torch.randn(3, 10), "b": torch.randn(3, 6)}
+    grads = {"a": torch.randn(4, 10), "b": torch.randn(4, 6)}
+
+    def make_scorer():
+        return Scorer(
+            query_grads=queries,
+            modules=list(queries),
+            writer=InMemorySequenceScoreWriter(4, 1 if score_mode == "nearest" else 3),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            unit_normalize=unit_normalize,
+            score_mode=score_mode,
+        )
+
+    streaming = make_scorer()
+    for name, g in grads.items():
+        streaming.accumulate(name, g)
+    streaming(list(range(4)), {})
+
+    batch = make_scorer()
+    batch(list(range(4)), grads)
+    torch.testing.assert_close(streaming.writer.scores, batch.writer.scores)
+
+
 def test_scorer_hessians(tmp_path: Path):
     """Test that Scorer applies hessians via index_transform."""
 
