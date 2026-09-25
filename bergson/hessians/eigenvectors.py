@@ -1,5 +1,6 @@
 import gc
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import torch
@@ -240,17 +241,18 @@ def _compute_full_matrix(
     shard_path: str | os.PathLike,
     rank: int,
     world_size: int,
+    device: str | torch.device | None = None,
 ) -> Tensor:
     """
-    Load a full matrix from sharded covariance files.
-    Needed to compute eigendecomposition.
+    Load a full matrix from sharded covariance files onto ``device``
+    (default: this rank's). Needed to compute eigendecomposition.
     """
     files = os.listdir(shard_path)
     assert (
         len(files) == world_size
     ), f"Expected {world_size} shards, found {len(files)} in {shard_path}"
 
-    device = get_device(rank)
+    device = str(device or get_device(rank))
     full_matrix = None
 
     if world_size == 1:
@@ -272,9 +274,44 @@ def _compute_full_matrix(
     return full_matrix
 
 
+def _eigendecompose(
+    key: str,
+    covariance_path: str,
+    total_processed: Tensor,
+    rank: int,
+    world_size: int,
+    device: str | torch.device,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor]:
+    """Eigenvectors and eigenvalues of ``key``'s normalized covariance, computed
+    on ``device`` in fp64 and returned on the CPU in ``dtype``."""
+    matrix = _compute_full_matrix(key, covariance_path, rank, world_size, device)
+
+    matrix_normalized = matrix.to(torch.float64) / total_processed.to(matrix.device)
+    matrix_normalized = (matrix_normalized + matrix_normalized.T).div(2)
+
+    if not torch.isfinite(matrix_normalized).all():
+        raise ValueError(
+            f"Covariance matrix for {key} contains NaNs or Infs. "
+            "Consider using fp32."
+        )
+
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix_normalized)
+    except Exception as e:
+        raise RuntimeError(f"Eigendecomposition failed for {key}") from e
+
+    # TODO: Maybe possible to avoid CPU transfer here?
+    return (
+        eigenvectors.to(dtype).to(device="cpu").contiguous(),
+        eigenvalues.to(dtype).to(device="cpu").contiguous(),
+    )
+
+
 def compute_eigendecomposition(
     covariance_path: str,
     total_processed: int | Tensor,
+    factor_devices: list[str] | None = None,
 ) -> dict[str, Tensor]:
     """
     Compute eigendecomposition from covariance matrices (Eq. 18 from paper).
@@ -287,6 +324,8 @@ def compute_eigendecomposition(
     Args:
         covariance_path: Full path to the covariance sharded directory.
         total_processed: Number of samples used to compute covariance.
+        factor_devices: Single-process only: split the keys across these
+            devices, one thread each.
 
     Returns:
         Per-key eigenvalue shards (rows per shard_bounds) on CPU. The
@@ -310,53 +349,44 @@ def compute_eigendecomposition(
         all_keys = list(f.keys())
         original_dtype = f.get_tensor(all_keys[0]).dtype
         # Get dimensions for fair distribution (columns not sharded, shape[-1]=d)
-        key_dimensions = {key: f.get_tensor(key).shape[-1] for key in all_keys}
-
-    # Distribute keys fairly based on O(d³) eigendecomposition cost
-    all_assignments = fair_distribute_by_cost(key_dimensions, world_size)
-    keys_for_this_rank = all_assignments[rank]
+        key_dimensions = {key: f.get_slice(key).get_shape()[-1] for key in all_keys}
 
     covariance_eigenvectors: dict[str, Tensor] = {}
     covariance_eigenvalues: dict[str, Tensor] = {}
 
-    for key in tqdm(
-        keys_for_this_rank,
-        disable=False,
-        desc=f"Rank {rank}: Computing eigenvectors",
-        position=rank,
-        leave=False,
-    ):
-        matrix = _compute_full_matrix(
-            name=key,
-            shard_path=covariance_path,
-            rank=rank,
-            world_size=world_size,
-        )
-
-        # original_dtype = matrix.dtype
-        matrix_normalized = matrix.to(torch.float64) / total_processed
-        matrix_normalized = (matrix_normalized + matrix_normalized.T).div(2)
-
-        if not torch.isfinite(matrix_normalized).all():
-            raise ValueError(
-                f"Covariance matrix for {key} contains NaNs or Infs. "
-                "Consider using fp32."
+    def decompose_all(keys: list[str], on: str | torch.device, position: int):
+        for key in tqdm(
+            keys,
+            desc=f"Rank {rank}: Computing eigenvectors on {on}",
+            position=position,
+            leave=False,
+        ):
+            vectors, values = _eigendecompose(
+                key,
+                covariance_path,
+                total_processed,
+                rank,
+                world_size,
+                on,
+                original_dtype,
             )
+            covariance_eigenvectors[key] = vectors
+            covariance_eigenvalues[key] = values
 
-        try:
-            eigenvalues, eigenvectors = torch.linalg.eigh(matrix_normalized)
-        except Exception as e:
-            raise RuntimeError(f"Eigendecomposition failed for {key}") from e
-
-        # TODO: Maybe possible to avoid CPU transfer here?
-        eigenvectors = eigenvectors.to(original_dtype).to(device="cpu").contiguous()
-        covariance_eigenvectors[key] = eigenvectors
-        covariance_eigenvalues[key] = (
-            eigenvalues.to(original_dtype).to(device="cpu").contiguous()
-        )
-        covariance_eigenvalues[key] = (
-            eigenvalues.to(original_dtype).to(device="cpu").contiguous()
-        )
+    if factor_devices:
+        assert world_size == 1, "factor_devices needs a single process"
+        groups = fair_distribute_by_cost(key_dimensions, len(factor_devices))
+        with ThreadPoolExecutor(len(factor_devices)) as pool:
+            futures = [
+                pool.submit(decompose_all, keys, on, i)
+                for i, (keys, on) in enumerate(zip(groups, factor_devices))
+            ]
+            for future in futures:
+                future.result()
+    else:
+        # Distribute keys fairly based on O(d³) eigendecomposition cost
+        all_assignments = fair_distribute_by_cost(key_dimensions, world_size)
+        decompose_all(all_assignments[rank], device, rank)
 
     covariance_eigenvectors = _gather_and_shard_along_dim_0(
         input_dict=covariance_eigenvectors,

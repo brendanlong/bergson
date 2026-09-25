@@ -345,10 +345,12 @@ def fit_factored_hessians(
     eigenvalues_a = compute_eigendecomposition(
         os.path.join(path, "activation_sharded"),
         total_processed=total_processed,
+        factor_devices=hessian_cfg.factor_devices,
     )
     eigenvalues_g = compute_eigendecomposition(
         os.path.join(path, "gradient_sharded"),
         total_processed=total_processed,
+        factor_devices=hessian_cfg.factor_devices,
     )
 
     dist.barrier() if dist.is_initialized() else None
